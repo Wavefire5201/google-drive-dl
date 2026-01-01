@@ -1,0 +1,9 @@
+# Binary
+gdrive-dl
+
+# Google Drive credentials/tokens
+token.json
+
+# IDE
+.idea/
+.vscode/

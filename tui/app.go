@@ -99,7 +99,7 @@ type Model struct {
 	downloadDone     bool
 	completedCount   int
 	totalToDownload  int
-	progressMu       sync.Mutex
+	progressMu       *sync.Mutex
 	downloadingFiles []drive.DriveFile // Files currently being downloaded
 
 	// Auto-download mode
@@ -151,6 +151,7 @@ func NewModel(authMethod AuthMethod, authValue, linksFile, destDir string, maxCo
 		searchInput:   si,
 		selectedFiles: make(map[string]bool),
 		fileProgress:  make(map[string]drive.DownloadProgress),
+		progressMu:    &sync.Mutex{},
 		authMethod:    authMethod,
 		authValue:     authValue,
 		linksFile:     linksFile,
@@ -188,6 +189,7 @@ func NewModelWithClient(client *drive.Client, linksFile, destDir string, maxConc
 		searchInput:     si,
 		selectedFiles:   make(map[string]bool),
 		fileProgress:    make(map[string]drive.DownloadProgress),
+		progressMu:      &sync.Mutex{},
 		driveClient:     client,
 		linksFile:       linksFile,
 		destDir:         destDir,
@@ -356,10 +358,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.fromCache = false
 		m.sortFiles()
 
-		// Save to cache
-		if m.cacheManager != nil {
-			m.saveFilesToCache(msg.files)
-		}
+		// Cache is already saved in loadFilesWithCache
 
 		// If auto-download mode is enabled, filter and download immediately
 		if m.autoDownload {
@@ -487,26 +486,30 @@ func (m Model) submitLinks() (tea.Model, tea.Cmd) {
 
 func (m Model) loadFilesWithCache(forceRefresh bool) tea.Cmd {
 	return func() tea.Msg {
+		// Build a combined cache key from all folder IDs
+		var folderIDs []string
+		for _, link := range m.links {
+			folderID, err := drive.ExtractFolderID(link)
+			if err != nil {
+				continue
+			}
+			folderIDs = append(folderIDs, folderID)
+		}
+
+		if len(folderIDs) == 0 {
+			return errMsg{fmt.Errorf("no valid folder IDs found")}
+		}
+
+		// Sort for consistent cache key
+		sort.Strings(folderIDs)
+		cacheKey := strings.Join(folderIDs, "+")
+
 		// If not forcing refresh, try cache first
 		if !forceRefresh && m.cacheManager != nil {
-			var cachedFiles []drive.DriveFile
-			cachedAt := make(map[string]time.Time)
-			allCached := true
-
-			for _, link := range m.links {
-				folderID, err := drive.ExtractFolderID(link)
-				if err != nil {
-					allCached = false
-					break
-				}
-
-				cached := m.cacheManager.GetFolder(folderID)
-				if cached == nil {
-					allCached = false
-					break
-				}
-
+			cached := m.cacheManager.GetFolder(cacheKey)
+			if cached != nil && len(cached.Files) > 0 {
 				// Convert cached files to drive files
+				var cachedFiles []drive.DriveFile
 				for _, cf := range cached.Files {
 					cachedFiles = append(cachedFiles, drive.DriveFile{
 						ID:           cf.ID,
@@ -519,10 +522,7 @@ func (m Model) loadFilesWithCache(forceRefresh bool) tea.Cmd {
 						ModifiedTime: cf.ModifiedTime,
 					})
 				}
-				cachedAt[folderID] = cached.FetchedAt
-			}
-
-			if allCached && len(cachedFiles) > 0 {
+				cachedAt := map[string]time.Time{cacheKey: cached.FetchedAt}
 				return filesFromCacheMsg{files: cachedFiles, cachedAt: cachedAt}
 			}
 		}
@@ -533,68 +533,25 @@ func (m Model) loadFilesWithCache(forceRefresh bool) tea.Cmd {
 			return errMsg{err}
 		}
 
-		// Save to cache
+		// Save to cache using combined key
 		if m.cacheManager != nil {
-			m.saveFilesToCache(files)
+			var cachedFiles []cache.CachedFile
+			for _, f := range files {
+				cachedFiles = append(cachedFiles, cache.CachedFile{
+					ID:           f.ID,
+					Name:         f.Name,
+					Path:         f.Path,
+					Size:         f.Size,
+					FolderID:     f.FolderID,
+					MimeType:     f.MimeType,
+					CreatedTime:  f.CreatedTime,
+					ModifiedTime: f.ModifiedTime,
+				})
+			}
+			m.cacheManager.SetFolder(cacheKey, "combined", cachedFiles)
 		}
 
 		return filesLoadedMsg{files}
-	}
-}
-
-func (m Model) saveFilesToCache(files []drive.DriveFile) {
-	// Group files by folder ID
-	byFolder := make(map[string][]cache.CachedFile)
-	folderNames := make(map[string]string)
-
-	for _, f := range files {
-		cf := cache.CachedFile{
-			ID:           f.ID,
-			Name:         f.Name,
-			Path:         f.Path,
-			Size:         f.Size,
-			FolderID:     f.FolderID,
-			MimeType:     f.MimeType,
-			CreatedTime:  f.CreatedTime,
-			ModifiedTime: f.ModifiedTime,
-		}
-		byFolder[f.FolderID] = append(byFolder[f.FolderID], cf)
-		if folderNames[f.FolderID] == "" {
-			// Use the root part of the path as folder name
-			if f.Path != "" {
-				parts := strings.Split(f.Path, "/")
-				folderNames[f.FolderID] = parts[0]
-			}
-		}
-	}
-
-	// Also group by the original folder IDs from links
-	for _, link := range m.links {
-		folderID, err := drive.ExtractFolderID(link)
-		if err != nil {
-			continue
-		}
-
-		// Collect all files that belong to this folder tree
-		var folderFiles []cache.CachedFile
-		for _, f := range files {
-			// Check if this file's path starts with this folder
-			// or if it was directly in this folder
-			folderFiles = append(folderFiles, cache.CachedFile{
-				ID:           f.ID,
-				Name:         f.Name,
-				Path:         f.Path,
-				Size:         f.Size,
-				FolderID:     f.FolderID,
-				MimeType:     f.MimeType,
-				CreatedTime:  f.CreatedTime,
-				ModifiedTime: f.ModifiedTime,
-			})
-		}
-
-		// For now, save all files under each folder ID from links
-		// This is a simplification - ideally we'd track which files came from which link
-		m.cacheManager.SetFolder(folderID, folderNames[folderID], folderFiles)
 	}
 }
 
@@ -682,7 +639,9 @@ func (m Model) updateFileList(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		case "G":
 			m.lastKeyG = false
-			m.fileCursor = len(displayFiles) - 1
+			if len(displayFiles) > 0 {
+				m.fileCursor = len(displayFiles) - 1
+			}
 		case "n":
 			m.lastKeyG = false
 			m.sortField = SortByName
@@ -836,7 +795,9 @@ func (m Model) updateFiles(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		case "G":
 			m.lastKeyG = false
-			m.fileCursor = len(displayFiles) - 1
+			if len(displayFiles) > 0 {
+				m.fileCursor = len(displayFiles) - 1
+			}
 		case " ":
 			m.lastKeyG = false
 			if m.fileCursor < len(displayFiles) {
@@ -929,6 +890,11 @@ func (m *Model) downloadFiles(files []drive.DriveFile) tea.Cmd {
 				defer wg.Done()
 				sem <- struct{}{}
 				defer func() { <-sem }()
+
+				// Check if context was cancelled while waiting for semaphore
+				if m.ctx.Err() != nil {
+					return
+				}
 
 				m.progressMu.Lock()
 				m.fileProgress[f.ID] = drive.DownloadProgress{
@@ -1435,10 +1401,7 @@ func (m Model) viewDone() string {
 	var failedFiles []string
 
 	m.progressMu.Lock()
-	for _, f := range m.filteredFiles {
-		if !m.selectedFiles[f.ID] {
-			continue
-		}
+	for _, f := range m.downloadingFiles {
 		if prog, ok := m.fileProgress[f.ID]; ok {
 			if prog.Error != nil {
 				errorCount++
@@ -1604,10 +1567,11 @@ func truncateAndPad(s string, width int) string {
 }
 
 func truncate(s string, max int) string {
-	if len(s) <= max {
+	runes := []rune(s)
+	if len(runes) <= max {
 		return s
 	}
-	return s[:max-3] + "..."
+	return string(runes[:max-3]) + "..."
 }
 
 // fileExistsLocally checks if a file already exists in the destination directory with the same size

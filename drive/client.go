@@ -144,9 +144,9 @@ func getTokenFromWeb(config *oauth2.Config) (*oauth2.Token, error) {
 	fmt.Printf("\n=== Google Drive Authorization ===\n")
 	fmt.Printf("Open this link in your browser:\n\n")
 	fmt.Printf("  %v\n\n", authURL)
-	fmt.Printf("Waiting for authorization...\n")
+	fmt.Printf("Waiting for authorization (5 minute timeout)...\n")
 
-	// Wait for the code
+	// Wait for the code with timeout
 	var authCode string
 	select {
 	case authCode = <-codeChan:
@@ -154,6 +154,9 @@ func getTokenFromWeb(config *oauth2.Config) (*oauth2.Token, error) {
 	case err := <-errChan:
 		server.Close()
 		return nil, err
+	case <-time.After(5 * time.Minute):
+		server.Close()
+		return nil, fmt.Errorf("OAuth authorization timed out after 5 minutes")
 	}
 
 	// Shutdown the server

@@ -802,8 +802,8 @@ func (m Model) viewFileList() string {
 	if width < 80 {
 		width = 80
 	}
-	// Reserve space for: cursor(2) + checkbox(3) + space(1) + size(10) + space(1) + date(12) + padding(4)
-	fixedWidth := 2 + 3 + 1 + 10 + 1 + 12 + 4
+	// Reserve space for: cursor(2) + checkbox(3) + space(1) + icon(2) + size(10) + space(1) + date(12) + padding(4)
+	fixedWidth := 2 + 3 + 1 + 2 + 10 + 1 + 12 + 4
 	nameWidth := width - fixedWidth
 	if nameWidth < 20 {
 		nameWidth = 20
@@ -820,7 +820,7 @@ func (m Model) viewFileList() string {
 		return ""
 	}
 
-	header := fmt.Sprintf("     %s %10s %12s",
+	header := fmt.Sprintf("       %s %10s %12s",
 		padRight("Name"+sortIndicator(SortByName), nameWidth),
 		"Size"+sortIndicator(SortBySize),
 		"Modified"+sortIndicator(SortByDate))
@@ -864,14 +864,21 @@ func (m Model) viewFileList() string {
 			checkbox = "[x]"
 		}
 
+		// Show green square if file exists locally
+		existsIcon := "  "
+		if m.fileExistsLocally(f) {
+			existsIcon = SuccessStyle.Render("■") + " "
+		}
+
 		dateStr := ""
 		if !f.ModifiedTime.IsZero() {
 			dateStr = f.ModifiedTime.Format("2006-01-02")
 		}
 
-		line := fmt.Sprintf("%s%s %s %10s %12s",
+		line := fmt.Sprintf("%s%s %s%s %10s %12s",
 			cursor,
 			checkbox,
+			existsIcon,
 			truncateAndPad(f.DisplayName(), nameWidth),
 			formatSize(f.Size),
 			dateStr)
@@ -929,15 +936,15 @@ func (m Model) viewFiles() string {
 	if width < 80 {
 		width = 80
 	}
-	// Reserve space for: cursor(2) + checkbox(3) + space(1) + size(10) + space(1) + date(12) + padding(4)
-	fixedWidth := 2 + 3 + 1 + 10 + 1 + 12 + 4
+	// Reserve space for: cursor(2) + checkbox(3) + space(1) + icon(2) + size(10) + space(1) + date(12) + padding(4)
+	fixedWidth := 2 + 3 + 1 + 2 + 10 + 1 + 12 + 4
 	nameWidth := width - fixedWidth
 	if nameWidth < 20 {
 		nameWidth = 20
 	}
 
 	// Header
-	header := fmt.Sprintf("     %s %10s %12s", padRight("Name", nameWidth), "Size", "Modified")
+	header := fmt.Sprintf("       %s %10s %12s", padRight("Name", nameWidth), "Size", "Modified")
 	s.WriteString(DimStyle.Render(header))
 	s.WriteString("\n")
 	s.WriteString(DimStyle.Render(strings.Repeat("-", width-2)))
@@ -978,14 +985,21 @@ func (m Model) viewFiles() string {
 			checkbox = "[x]"
 		}
 
+		// Show green square if file exists locally
+		existsIcon := "  "
+		if m.fileExistsLocally(f) {
+			existsIcon = SuccessStyle.Render("■") + " "
+		}
+
 		dateStr := ""
 		if !f.ModifiedTime.IsZero() {
 			dateStr = f.ModifiedTime.Format("2006-01-02")
 		}
 
-		line := fmt.Sprintf("%s%s %s %10s %12s",
+		line := fmt.Sprintf("%s%s %s%s %10s %12s",
 			cursor,
 			checkbox,
+			existsIcon,
 			truncateAndPad(f.DisplayName(), nameWidth),
 			formatSize(f.Size),
 			dateStr)
@@ -1275,4 +1289,24 @@ func truncate(s string, max int) string {
 		return s
 	}
 	return s[:max-3] + "..."
+}
+
+// fileExistsLocally checks if a file already exists in the destination directory with the same size
+func (m Model) fileExistsLocally(f drive.DriveFile) bool {
+	destDir := m.destDir
+	if destDir == "" {
+		destDir = "./output"
+	}
+
+	fullPath := destDir
+	if f.Path != "" {
+		fullPath = fmt.Sprintf("%s/%s", destDir, f.Path)
+	}
+	filePath := fmt.Sprintf("%s/%s", fullPath, f.Name)
+
+	info, err := os.Stat(filePath)
+	if err != nil {
+		return false
+	}
+	return info.Size() == f.Size
 }

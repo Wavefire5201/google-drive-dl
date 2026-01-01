@@ -1,5 +1,6 @@
 # Binary
 gdrive-dl
+img-util
 
 # Environment and secrets
 .env
@@ -9,3 +10,6 @@ credentials.json
 # IDE
 .idea/
 .vscode/
+
+# output folder
+output/

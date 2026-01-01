@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"img-util/cache"
 	"img-util/drive"
 
 	"github.com/charmbracelet/bubbles/textarea"
@@ -61,6 +62,11 @@ type Model struct {
 	// Drive client
 	driveClient *drive.Client
 
+	// Cache manager
+	cacheManager *cache.Manager
+	cachedAt     map[string]time.Time // folder ID -> when it was cached
+	fromCache    bool                 // whether current files are from cache
+
 	// Links input
 	linksInput textarea.Model
 	links      []string
@@ -82,13 +88,19 @@ type Model struct {
 	// Info popup
 	showInfoPopup bool
 
+	// Dedupe mode - show only smallest version of duplicate files
+	showDeduped          bool
+	dedupedFiles         []drive.DriveFile
+	dedupedFilteredFiles []drive.DriveFile
+
 	// Download progress
-	fileProgress    map[string]drive.DownloadProgress
-	downloading     bool
-	downloadDone    bool
-	completedCount  int
-	totalToDownload int
-	progressMu      sync.Mutex
+	fileProgress     map[string]drive.DownloadProgress
+	downloading      bool
+	downloadDone     bool
+	completedCount   int
+	totalToDownload  int
+	progressMu       sync.Mutex
+	downloadingFiles []drive.DriveFile // Files currently being downloaded
 
 	// Auto-download mode
 	autoDownload    bool
@@ -106,6 +118,13 @@ type downloadProgressMsg drive.DownloadProgress
 type downloadCompleteMsg struct{ errors []string }
 type clientReadyMsg struct{ client *drive.Client }
 type tickMsg struct{}
+type filesFromCacheMsg struct {
+	files    []drive.DriveFile
+	cachedAt map[string]time.Time
+}
+type refreshCompleteMsg struct {
+	files []drive.DriveFile
+}
 
 func (e errMsg) Error() string { return e.err.Error() }
 
@@ -123,6 +142,9 @@ func NewModel(authMethod AuthMethod, authValue, linksFile, destDir string, maxCo
 
 	ctx, cancel := context.WithCancel(context.Background())
 
+	// Initialize cache manager (ignore errors, cache is optional)
+	cacheMgr, _ := cache.NewManager()
+
 	return Model{
 		view:          ViewLinks,
 		linksInput:    ti,
@@ -138,6 +160,8 @@ func NewModel(authMethod AuthMethod, authValue, linksFile, destDir string, maxCo
 		cancel:        cancel,
 		sortField:     SortByName,
 		sortAsc:       true,
+		cacheManager:  cacheMgr,
+		cachedAt:      make(map[string]time.Time),
 	}
 }
 
@@ -155,6 +179,9 @@ func NewModelWithClient(client *drive.Client, linksFile, destDir string, maxConc
 
 	ctx, cancel := context.WithCancel(context.Background())
 
+	// Initialize cache manager (ignore errors, cache is optional)
+	cacheMgr, _ := cache.NewManager()
+
 	return Model{
 		view:            ViewLinks,
 		linksInput:      ti,
@@ -171,6 +198,8 @@ func NewModelWithClient(client *drive.Client, linksFile, destDir string, maxConc
 		sortAsc:         true,
 		autoDownload:    autoDownload,
 		autoSearchTerms: searchTerms,
+		cacheManager:    cacheMgr,
+		cachedAt:        make(map[string]time.Time),
 	}
 }
 
@@ -240,7 +269,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.cancel()
 			return m, tea.Quit
 		case "q":
-			if m.view == ViewDone || m.view == ViewFileList {
+			// Quit from any view except text input views (Links, Search)
+			switch m.view {
+			case ViewFileList, ViewFiles, ViewDownloading, ViewDone:
 				m.cancel()
 				return m, tea.Quit
 			}
@@ -279,9 +310,56 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.err = msg.err
 		return m, nil
 
+	case filesFromCacheMsg:
+		m.allFiles = msg.files
+		m.cachedAt = msg.cachedAt
+		m.fromCache = true
+		m.sortFiles()
+
+		// If auto-download mode is enabled, filter and download immediately
+		if m.autoDownload {
+			if m.autoSearchTerms != "" {
+				terms := strings.Split(m.autoSearchTerms, ",")
+				var cleanTerms []string
+				for _, t := range terms {
+					t = strings.TrimSpace(t)
+					if t != "" {
+						cleanTerms = append(cleanTerms, t)
+					}
+				}
+				m.searchTerms = cleanTerms
+				m.filteredFiles = drive.FilterFiles(m.allFiles, cleanTerms)
+			} else {
+				m.filteredFiles = m.allFiles
+			}
+
+			if len(m.filteredFiles) == 0 {
+				m.err = fmt.Errorf("no files match the search terms")
+				m.view = ViewDone
+				return m, nil
+			}
+
+			m.selectedFiles = make(map[string]bool)
+			for _, f := range m.filteredFiles {
+				m.selectedFiles[f.ID] = true
+			}
+
+			return m.startDownload()
+		}
+
+		m.view = ViewFileList
+		m.fileCursor = 0
+		return m, nil
+
 	case filesLoadedMsg:
 		m.allFiles = msg.files
+		m.fromCache = false
 		m.sortFiles()
+
+		// Save to cache
+		if m.cacheManager != nil {
+			m.saveFilesToCache(msg.files)
+		}
 
 		// If auto-download mode is enabled, filter and download immediately
 		if m.autoDownload {
@@ -403,7 +481,125 @@ func (m Model) submitLinks() (tea.Model, tea.Cmd) {
 	m.links = links
 	m.err = nil
 
-	return m, m.loadFiles()
+	// Try to load from cache first
+	return m, m.loadFilesWithCache(false)
+}
+
+func (m Model) loadFilesWithCache(forceRefresh bool) tea.Cmd {
+	return func() tea.Msg {
+		// If not forcing refresh, try cache first
+		if !forceRefresh && m.cacheManager != nil {
+			var cachedFiles []drive.DriveFile
+			cachedAt := make(map[string]time.Time)
+			allCached := true
+
+			for _, link := range m.links {
+				folderID, err := drive.ExtractFolderID(link)
+				if err != nil {
+					allCached = false
+					break
+				}
+
+				cached := m.cacheManager.GetFolder(folderID)
+				if cached == nil {
+					allCached = false
+					break
+				}
+
+				// Convert cached files to drive files
+				for _, cf := range cached.Files {
+					cachedFiles = append(cachedFiles, drive.DriveFile{
+						ID:           cf.ID,
+						Name:         cf.Name,
+						Path:         cf.Path,
+						Size:         cf.Size,
+						FolderID:     cf.FolderID,
+						MimeType:     cf.MimeType,
+						CreatedTime:  cf.CreatedTime,
+						ModifiedTime: cf.ModifiedTime,
+					})
+				}
+				cachedAt[folderID] = cached.FetchedAt
+			}
+
+			if allCached && len(cachedFiles) > 0 {
+				return filesFromCacheMsg{files: cachedFiles, cachedAt: cachedAt}
+			}
+		}
+
+		// Fetch from Google Drive
+		files, err := m.driveClient.ListFilesFromFolders(m.ctx, m.links)
+		if err != nil {
+			return errMsg{err}
+		}
+
+		// Save to cache
+		if m.cacheManager != nil {
+			m.saveFilesToCache(files)
+		}
+
+		return filesLoadedMsg{files}
+	}
+}
+
+func (m Model) saveFilesToCache(files []drive.DriveFile) {
+	// Group files by folder ID
+	byFolder := make(map[string][]cache.CachedFile)
+	folderNames := make(map[string]string)
+
+	for _, f := range files {
+		cf := cache.CachedFile{
+			ID:           f.ID,
+			Name:         f.Name,
+			Path:         f.Path,
+			Size:         f.Size,
+			FolderID:     f.FolderID,
+			MimeType:     f.MimeType,
+			CreatedTime:  f.CreatedTime,
+			ModifiedTime: f.ModifiedTime,
+		}
+		byFolder[f.FolderID] = append(byFolder[f.FolderID], cf)
+		if folderNames[f.FolderID] == "" {
+			// Use the root part of the path as folder name
+			if f.Path != "" {
+				parts := strings.Split(f.Path, "/")
+				folderNames[f.FolderID] = parts[0]
+			}
+		}
+	}
+
+	// Also group by the original folder IDs from links
+	for _, link := range m.links {
+		folderID, err := drive.ExtractFolderID(link)
+		if err != nil {
+			continue
+		}
+
+		// Collect all files that belong to this folder tree
+		var folderFiles []cache.CachedFile
+		for _, f := range files {
+			// Check if this file's path starts with this folder
+			// or if it was directly in this folder
+			folderFiles = append(folderFiles, cache.CachedFile{
+				ID:           f.ID,
+				Name:         f.Name,
+				Path:         f.Path,
+				Size:         f.Size,
+				FolderID:     f.FolderID,
+				MimeType:     f.MimeType,
+				CreatedTime:  f.CreatedTime,
+				ModifiedTime: f.ModifiedTime,
+			})
+		}
+
+		// For now, save all files under each folder ID from links
+		// This is a simplification - ideally we'd track which files came from which link
+		m.cacheManager.SetFolder(folderID, folderNames[folderID], folderFiles)
+	}
+}
+
+func (m Model) refreshFiles() tea.Cmd {
+	return m.loadFilesWithCache(true)
 }
 
 func (m Model) loadFiles() tea.Cmd {
@@ -434,7 +630,25 @@ func (m *Model) sortFiles() {
 	})
 }
 
+// getDisplayFiles returns the current file list (deduped or all)
+func (m Model) getDisplayFiles() []drive.DriveFile {
+	if m.showDeduped && len(m.dedupedFiles) > 0 {
+		return m.dedupedFiles
+	}
+	return m.allFiles
+}
+
+// getDisplayFilteredFiles returns the current filtered file list (deduped or all)
+func (m Model) getDisplayFilteredFiles() []drive.DriveFile {
+	if m.showDeduped && len(m.dedupedFilteredFiles) > 0 {
+		return m.dedupedFilteredFiles
+	}
+	return m.filteredFiles
+}
+
 func (m Model) updateFileList(msg tea.Msg) (tea.Model, tea.Cmd) {
+	displayFiles := m.getDisplayFiles()
+
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		// Handle popup close first
@@ -455,7 +669,7 @@ func (m Model) updateFileList(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		case "down", "j":
 			m.lastKeyG = false
-			if m.fileCursor < len(m.allFiles)-1 {
+			if m.fileCursor < len(displayFiles)-1 {
 				m.fileCursor++
 			}
 		case "g":
@@ -468,40 +682,61 @@ func (m Model) updateFileList(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		case "G":
 			m.lastKeyG = false
-			m.fileCursor = len(m.allFiles) - 1
+			m.fileCursor = len(displayFiles) - 1
 		case "n":
 			m.lastKeyG = false
 			m.sortField = SortByName
 			m.sortAsc = !m.sortAsc
 			m.sortFiles()
+			if m.showDeduped {
+				m.dedupedFiles = dedupeFiles(m.allFiles)
+			}
 		case "s":
 			m.lastKeyG = false
 			m.sortField = SortBySize
 			m.sortAsc = !m.sortAsc
 			m.sortFiles()
+			if m.showDeduped {
+				m.dedupedFiles = dedupeFiles(m.allFiles)
+			}
 		case "d":
 			m.lastKeyG = false
 			m.sortField = SortByDate
 			m.sortAsc = !m.sortAsc
 			m.sortFiles()
+			if m.showDeduped {
+				m.dedupedFiles = dedupeFiles(m.allFiles)
+			}
 		case " ":
 			m.lastKeyG = false
 			// Toggle selection for current file
-			if m.fileCursor < len(m.allFiles) {
-				f := m.allFiles[m.fileCursor]
+			if m.fileCursor < len(displayFiles) {
+				f := displayFiles[m.fileCursor]
 				m.selectedFiles[f.ID] = !m.selectedFiles[f.ID]
 			}
 		case "a":
 			m.lastKeyG = false
-			// Toggle all files
+			// Toggle all files in current view
 			m.selectAll = !m.selectAll
-			for _, f := range m.allFiles {
+			for _, f := range displayFiles {
 				m.selectedFiles[f.ID] = m.selectAll
 			}
 		case "i":
 			m.lastKeyG = false
 			// Toggle info popup
 			m.showInfoPopup = !m.showInfoPopup
+		case "u":
+			m.lastKeyG = false
+			// Toggle dedupe mode - show only smallest version of duplicates
+			m.showDeduped = !m.showDeduped
+			if m.showDeduped {
+				m.dedupedFiles = dedupeFiles(m.allFiles)
+			}
+			m.fileCursor = 0
+		case "r":
+			m.lastKeyG = false
+			// Refresh files from Google Drive (bypass cache)
+			return m, m.refreshFiles()
 		case "enter":
 			m.lastKeyG = false
 			// Download selected files
@@ -566,6 +801,8 @@ func (m Model) submitSearch() (tea.Model, tea.Cmd) {
 }
 
 func (m Model) updateFiles(msg tea.Msg) (tea.Model, tea.Cmd) {
+	displayFiles := m.getDisplayFilteredFiles()
+
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		// Handle popup close first
@@ -586,7 +823,7 @@ func (m Model) updateFiles(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		case "down", "j":
 			m.lastKeyG = false
-			if m.fileCursor < len(m.filteredFiles)-1 {
+			if m.fileCursor < len(displayFiles)-1 {
 				m.fileCursor++
 			}
 		case "g":
@@ -599,26 +836,40 @@ func (m Model) updateFiles(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		case "G":
 			m.lastKeyG = false
-			m.fileCursor = len(m.filteredFiles) - 1
+			m.fileCursor = len(displayFiles) - 1
 		case " ":
 			m.lastKeyG = false
-			if m.fileCursor < len(m.filteredFiles) {
-				f := m.filteredFiles[m.fileCursor]
+			if m.fileCursor < len(displayFiles) {
+				f := displayFiles[m.fileCursor]
 				m.selectedFiles[f.ID] = !m.selectedFiles[f.ID]
 			}
 		case "a":
 			m.lastKeyG = false
 			m.selectAll = !m.selectAll
-			for _, f := range m.filteredFiles {
+			for _, f := range displayFiles {
 				m.selectedFiles[f.ID] = m.selectAll
 			}
 		case "i":
 			m.lastKeyG = false
 			// Toggle info popup
 			m.showInfoPopup = !m.showInfoPopup
+		case "u":
+			m.lastKeyG = false
+			// Toggle dedupe mode - show only smallest version of duplicates
+			m.showDeduped = !m.showDeduped
+			if m.showDeduped {
+				m.dedupedFilteredFiles = dedupeFiles(m.filteredFiles)
+			}
+			m.fileCursor = 0
 		case "enter":
 			m.lastKeyG = false
 			return m.startDownload()
+		case "esc":
+			m.lastKeyG = false
+			m.view = ViewFileList
+			m.fileCursor = 0
+			m.showDeduped = false // Reset dedupe when going back
+			return m, nil
 		default:
 			m.lastKeyG = false
 		}
@@ -628,8 +879,16 @@ func (m Model) updateFiles(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m Model) startDownload() (tea.Model, tea.Cmd) {
+	// Use the appropriate file list based on current view and dedupe mode
+	var sourceFiles []drive.DriveFile
+	if m.view == ViewFileList {
+		sourceFiles = m.getDisplayFiles()
+	} else {
+		sourceFiles = m.getDisplayFilteredFiles()
+	}
+
 	var toDownload []drive.DriveFile
-	for _, f := range m.filteredFiles {
+	for _, f := range sourceFiles {
 		if m.selectedFiles[f.ID] {
 			toDownload = append(toDownload, f)
 		}
@@ -642,6 +901,7 @@ func (m Model) startDownload() (tea.Model, tea.Cmd) {
 
 	m.totalToDownload = len(toDownload)
 	m.completedCount = 0
+	m.downloadingFiles = toDownload // Store the files being downloaded
 	m.view = ViewDownloading
 	m.downloading = true
 
@@ -779,10 +1039,16 @@ func (m Model) viewLinks() string {
 func (m Model) viewFileList() string {
 	var s strings.Builder
 
+	// Use deduped files if mode is enabled
+	displayFiles := m.allFiles
+	if m.showDeduped && len(m.dedupedFiles) > 0 {
+		displayFiles = m.dedupedFiles
+	}
+
 	// Calculate total size and selected count
 	var totalSize, selectedSize int64
 	selectedCount := 0
-	for _, f := range m.allFiles {
+	for _, f := range displayFiles {
 		totalSize += f.Size
 		if m.selectedFiles[f.ID] {
 			selectedCount++
@@ -790,10 +1056,31 @@ func (m Model) viewFileList() string {
 		}
 	}
 
+	// Show dedupe indicator if active
+	dedupeIndicator := ""
+	if m.showDeduped {
+		dedupeIndicator = fmt.Sprintf(" [DEDUPED: %d → %d]", len(m.allFiles), len(displayFiles))
+	}
+
+	// Show cache indicator
+	cacheIndicator := ""
+	if m.fromCache {
+		// Find the oldest cache time
+		var oldestCache time.Time
+		for _, t := range m.cachedAt {
+			if oldestCache.IsZero() || t.Before(oldestCache) {
+				oldestCache = t
+			}
+		}
+		if !oldestCache.IsZero() {
+			cacheIndicator = fmt.Sprintf(" [cached %s]", formatTimeAgo(oldestCache))
+		}
+	}
+
 	if selectedCount > 0 {
-		s.WriteString(SubtitleStyle.Render(fmt.Sprintf("Found %d files | Selected: %d (%s)", len(m.allFiles), selectedCount, formatSize(selectedSize))))
+		s.WriteString(SubtitleStyle.Render(fmt.Sprintf("Found %d files%s%s | Selected: %d (%s)", len(displayFiles), dedupeIndicator, cacheIndicator, selectedCount, formatSize(selectedSize))))
 	} else {
-		s.WriteString(SubtitleStyle.Render(fmt.Sprintf("Found %d files (%s total)", len(m.allFiles), formatSize(totalSize))))
+		s.WriteString(SubtitleStyle.Render(fmt.Sprintf("Found %d files (%s total)%s%s", len(displayFiles), formatSize(totalSize), dedupeIndicator, cacheIndicator)))
 	}
 	s.WriteString("\n")
 
@@ -831,20 +1118,20 @@ func (m Model) viewFileList() string {
 
 	// Pagination
 	visibleStart := 0
-	visibleEnd := len(m.allFiles)
+	visibleEnd := len(displayFiles)
 	maxVisible := m.height - 12
 	if maxVisible < 5 {
 		maxVisible = 10
 	}
 
-	if len(m.allFiles) > maxVisible {
+	if len(displayFiles) > maxVisible {
 		visibleStart = m.fileCursor - maxVisible/2
 		if visibleStart < 0 {
 			visibleStart = 0
 		}
 		visibleEnd = visibleStart + maxVisible
-		if visibleEnd > len(m.allFiles) {
-			visibleEnd = len(m.allFiles)
+		if visibleEnd > len(displayFiles) {
+			visibleEnd = len(displayFiles)
 			visibleStart = visibleEnd - maxVisible
 			if visibleStart < 0 {
 				visibleStart = 0
@@ -853,7 +1140,7 @@ func (m Model) viewFileList() string {
 	}
 
 	for i := visibleStart; i < visibleEnd; i++ {
-		f := m.allFiles[i]
+		f := displayFiles[i]
 		cursor := "  "
 		if i == m.fileCursor {
 			cursor = "> "
@@ -892,12 +1179,12 @@ func (m Model) viewFileList() string {
 	}
 
 	s.WriteString("\n")
-	s.WriteString(HelpStyle.Render("j/k:move | gg/G:top/bottom | Space:toggle | a:all | i:info | Enter:download | /:search | n/s/d:sort | q:quit"))
+	s.WriteString(HelpStyle.Render("j/k:move | gg/G:top/bottom | Space:toggle | a:all | i:info | u:dedupe | r:refresh | Enter:download | /:search | n/s/d:sort | q:quit"))
 
 	// Show info popup if active
-	if m.showInfoPopup && m.fileCursor < len(m.allFiles) {
+	if m.showInfoPopup && m.fileCursor < len(displayFiles) {
 		s.WriteString("\n\n")
-		s.WriteString(m.renderInfoPopup(m.allFiles[m.fileCursor]))
+		s.WriteString(m.renderInfoPopup(displayFiles[m.fileCursor]))
 	}
 
 	return s.String()
@@ -918,17 +1205,29 @@ func (m Model) viewSearch() string {
 func (m Model) viewFiles() string {
 	var s strings.Builder
 
+	// Use deduped files if mode is enabled
+	displayFiles := m.filteredFiles
+	if m.showDeduped && len(m.dedupedFilteredFiles) > 0 {
+		displayFiles = m.dedupedFilteredFiles
+	}
+
 	selectedCount := 0
 	var selectedSize int64
-	for _, f := range m.filteredFiles {
+	for _, f := range displayFiles {
 		if m.selectedFiles[f.ID] {
 			selectedCount++
 			selectedSize += f.Size
 		}
 	}
 
-	s.WriteString(SubtitleStyle.Render(fmt.Sprintf("Matching files: %d/%d selected (%s)",
-		selectedCount, len(m.filteredFiles), formatSize(selectedSize))))
+	// Show dedupe indicator if active
+	dedupeIndicator := ""
+	if m.showDeduped {
+		dedupeIndicator = fmt.Sprintf(" [DEDUPED: %d → %d]", len(m.filteredFiles), len(displayFiles))
+	}
+
+	s.WriteString(SubtitleStyle.Render(fmt.Sprintf("Matching files: %d/%d selected (%s)%s",
+		selectedCount, len(displayFiles), formatSize(selectedSize), dedupeIndicator)))
 	s.WriteString("\n")
 
 	// Calculate dynamic widths based on terminal width
@@ -952,20 +1251,20 @@ func (m Model) viewFiles() string {
 
 	// Pagination
 	visibleStart := 0
-	visibleEnd := len(m.filteredFiles)
+	visibleEnd := len(displayFiles)
 	maxVisible := m.height - 12
 	if maxVisible < 5 {
 		maxVisible = 10
 	}
 
-	if len(m.filteredFiles) > maxVisible {
+	if len(displayFiles) > maxVisible {
 		visibleStart = m.fileCursor - maxVisible/2
 		if visibleStart < 0 {
 			visibleStart = 0
 		}
 		visibleEnd = visibleStart + maxVisible
-		if visibleEnd > len(m.filteredFiles) {
-			visibleEnd = len(m.filteredFiles)
+		if visibleEnd > len(displayFiles) {
+			visibleEnd = len(displayFiles)
 			visibleStart = visibleEnd - maxVisible
 			if visibleStart < 0 {
 				visibleStart = 0
@@ -974,7 +1273,7 @@ func (m Model) viewFiles() string {
 	}
 
 	for i := visibleStart; i < visibleEnd; i++ {
-		f := m.filteredFiles[i]
+		f := displayFiles[i]
 		cursor := "  "
 		if i == m.fileCursor {
 			cursor = "> "
@@ -1013,12 +1312,12 @@ func (m Model) viewFiles() string {
 	}
 
 	s.WriteString("\n")
-	s.WriteString(HelpStyle.Render("j/k:move | gg/G:top/bottom | Space:toggle | a:all | i:info | Enter:download | Esc:back"))
+	s.WriteString(HelpStyle.Render("j/k:move | gg/G:top/bottom | Space:toggle | a:all | i:info | u:dedupe | Enter:download | Esc:back | q:quit"))
 
 	// Show info popup if active
-	if m.showInfoPopup && m.fileCursor < len(m.filteredFiles) {
+	if m.showInfoPopup && m.fileCursor < len(displayFiles) {
 		s.WriteString("\n\n")
-		s.WriteString(m.renderInfoPopup(m.filteredFiles[m.fileCursor]))
+		s.WriteString(m.renderInfoPopup(displayFiles[m.fileCursor]))
 	}
 
 	return s.String()
@@ -1038,12 +1337,10 @@ func (m Model) viewDownloading() string {
 
 	// Calculate overall progress
 	var totalBytes, loadedBytes int64
-	for _, f := range m.filteredFiles {
-		if m.selectedFiles[f.ID] {
-			totalBytes += f.Size
-			if prog, ok := progress[f.ID]; ok {
-				loadedBytes += prog.BytesLoaded
-			}
+	for _, f := range m.downloadingFiles {
+		totalBytes += f.Size
+		if prog, ok := progress[f.ID]; ok {
+			loadedBytes += prog.BytesLoaded
 		}
 	}
 
@@ -1078,12 +1375,8 @@ func (m Model) viewDownloading() string {
 		nameWidth = 20
 	}
 
-	// Individual file progress - show all files
-	for _, f := range m.filteredFiles {
-		if !m.selectedFiles[f.ID] {
-			continue
-		}
-
+	// Individual file progress - show all files being downloaded
+	for _, f := range m.downloadingFiles {
 		prog, hasProgress := progress[f.ID]
 
 		var status string
@@ -1109,7 +1402,7 @@ func (m Model) viewDownloading() string {
 	}
 
 	s.WriteString("\n")
-	s.WriteString(HelpStyle.Render("Esc to cancel"))
+	s.WriteString(HelpStyle.Render("q:quit | Esc:cancel"))
 
 	return s.String()
 }
@@ -1240,6 +1533,32 @@ func formatSize(bytes int64) string {
 	return fmt.Sprintf("%.1f %cB", float64(bytes)/float64(div), "KMGTPE"[exp])
 }
 
+func formatTimeAgo(t time.Time) string {
+	diff := time.Since(t)
+
+	if diff < time.Minute {
+		return "just now"
+	} else if diff < time.Hour {
+		mins := int(diff.Minutes())
+		if mins == 1 {
+			return "1m ago"
+		}
+		return fmt.Sprintf("%dm ago", mins)
+	} else if diff < 24*time.Hour {
+		hours := int(diff.Hours())
+		if hours == 1 {
+			return "1h ago"
+		}
+		return fmt.Sprintf("%dh ago", hours)
+	} else {
+		days := int(diff.Hours() / 24)
+		if days == 1 {
+			return "1d ago"
+		}
+		return fmt.Sprintf("%dd ago", days)
+	}
+}
+
 // truncateWidth truncates a string to fit within a given display width,
 // properly handling wide characters (CJK, etc.)
 func truncateWidth(s string, maxWidth int) string {
@@ -1309,4 +1628,173 @@ func (m Model) fileExistsLocally(f drive.DriveFile) bool {
 		return false
 	}
 	return info.Size() == f.Size
+}
+
+// dedupeFiles groups files by folder and common prefix, returning only the smallest version of each group
+func dedupeFiles(files []drive.DriveFile) []drive.DriveFile {
+	// Group files by their folder path
+	byFolder := make(map[string][]drive.DriveFile)
+	for _, f := range files {
+		byFolder[f.Path] = append(byFolder[f.Path], f)
+	}
+
+	var result []drive.DriveFile
+
+	for _, folderFiles := range byFolder {
+		// For each folder, find duplicate groups and keep smallest
+		smallest := findSmallestDuplicates(folderFiles)
+		result = append(result, smallest...)
+	}
+
+	return result
+}
+
+// Known quality suffixes that indicate duplicate versions
+var qualitySuffixes = []string{
+	// Quality + format combinations
+	"A6BPng", "A6Bpng", "a6bpng", "A6BJpg", "A6Bjpg", "a6bjpg",
+	"ASPng", "ASpng", "aspng", "ASJpg", "ASjpg", "asjpg",
+	"UAPng", "UApng", "uapng", "UAJpg", "UAjpg", "uajpg",
+	// Quality prefixes alone (in case format is separate)
+	"A6B", "a6b",
+	"AS", "as",
+	"UA", "ua",
+	// Format suffixes
+	"Jpg", "jpg", "JPG",
+	"Png", "png", "PNG",
+	// Other quality indicators
+	"HQ", "hq",
+	"LQ", "lq",
+	"HD", "hd",
+	"SD", "sd",
+}
+
+// findSmallestDuplicates groups files by common prefix and returns the smallest from each group
+func findSmallestDuplicates(files []drive.DriveFile) []drive.DriveFile {
+	if len(files) <= 1 {
+		return files
+	}
+
+	// Build groups using union-find approach
+	// Key: normalized base name -> list of files
+	groups := make(map[string][]drive.DriveFile)
+
+	for _, f := range files {
+		// Get base name without extension
+		baseName := f.Name
+		if idx := strings.LastIndex(baseName, "."); idx > 0 {
+			baseName = baseName[:idx]
+		}
+
+		// Try to find a normalized key by stripping known quality suffixes
+		normalizedKey := normalizeBaseName(baseName)
+
+		// Check if this normalized key matches any existing group
+		foundGroup := ""
+		for key := range groups {
+			if keysMatch(normalizedKey, key) {
+				foundGroup = key
+				break
+			}
+		}
+
+		if foundGroup != "" {
+			groups[foundGroup] = append(groups[foundGroup], f)
+		} else {
+			groups[normalizedKey] = append(groups[normalizedKey], f)
+		}
+	}
+
+	// From each group, keep only the smallest file
+	var result []drive.DriveFile
+	for _, group := range groups {
+		if len(group) == 1 {
+			result = append(result, group[0])
+		} else {
+			// Find smallest
+			smallest := group[0]
+			for _, f := range group[1:] {
+				if f.Size < smallest.Size {
+					smallest = f
+				}
+			}
+			result = append(result, smallest)
+		}
+	}
+
+	return result
+}
+
+// normalizeBaseName strips known quality suffixes from a base name
+func normalizeBaseName(baseName string) string {
+	result := baseName
+	for _, suffix := range qualitySuffixes {
+		if strings.HasSuffix(result, suffix) {
+			result = strings.TrimSuffix(result, suffix)
+			break // Only strip one suffix
+		}
+	}
+	return result
+}
+
+// keysMatch checks if two normalized keys represent the same content
+// They match only if they are equal or one is a prefix of the other
+func keysMatch(a, b string) bool {
+	if a == b {
+		return true
+	}
+
+	// Check if one is prefix of the other (but must be the full normalized key)
+	// Only match if the shorter one is a prefix AND the longer one only has suffix remnants
+	if strings.HasPrefix(a, b) {
+		// b is prefix of a - check if remaining part looks like a suffix remnant
+		remainder := strings.TrimPrefix(a, b)
+		if isSuffixRemnant(remainder) {
+			return true
+		}
+	}
+	if strings.HasPrefix(b, a) {
+		// a is prefix of b - check if remaining part looks like a suffix remnant
+		remainder := strings.TrimPrefix(b, a)
+		if isSuffixRemnant(remainder) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// isSuffixRemnant checks if a string looks like leftover quality suffix that wasn't fully stripped
+func isSuffixRemnant(s string) bool {
+	if s == "" {
+		return true
+	}
+	// Common remnants from partial suffix matches
+	remnants := []string{"AS", "A6B", "UA", "Png", "png", "Jpg", "jpg"}
+	for _, r := range remnants {
+		if s == r || strings.HasPrefix(s, r) {
+			return true
+		}
+	}
+	return false
+}
+
+// commonPrefix returns the common prefix of two strings
+func commonPrefix(a, b string) string {
+	runesA := []rune(a)
+	runesB := []rune(b)
+
+	minLen := len(runesA)
+	if len(runesB) < minLen {
+		minLen = len(runesB)
+	}
+
+	var i int
+	for i = 0; i < minLen; i++ {
+		if runesA[i] != runesB[i] {
+			break
+		}
+	}
+
+	return string(runesA[:i])
 }

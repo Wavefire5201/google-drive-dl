@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"time"
 
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
@@ -19,10 +20,22 @@ import (
 
 // DriveFile represents a file from Google Drive
 type DriveFile struct {
-	ID       string
-	Name     string
-	Size     int64
-	FolderID string
+	ID           string
+	Name         string
+	Path         string // Parent folder path (for nested folders)
+	Size         int64
+	FolderID     string
+	MimeType     string
+	CreatedTime  time.Time
+	ModifiedTime time.Time
+}
+
+// DisplayName returns the name with path prefix if available
+func (f DriveFile) DisplayName() string {
+	if f.Path != "" {
+		return f.Path + "/" + f.Name
+	}
+	return f.Name
 }
 
 // DownloadProgress tracks download progress
@@ -32,6 +45,7 @@ type DownloadProgress struct {
 	BytesLoaded int64
 	TotalBytes  int64
 	Done        bool
+	Skipped     bool
 	Error       error
 }
 
@@ -40,8 +54,22 @@ type Client struct {
 	service *drive.Service
 }
 
-// NewClient creates a new Drive client using credentials.json
-func NewClient(ctx context.Context, credentialsPath string) (*Client, error) {
+// NewClientWithAPIKey creates a new Drive client using an API key
+func NewClientWithAPIKey(ctx context.Context, apiKey string) (*Client, error) {
+	if apiKey == "" {
+		return nil, fmt.Errorf("API key is required")
+	}
+
+	srv, err := drive.NewService(ctx, option.WithAPIKey(apiKey))
+	if err != nil {
+		return nil, fmt.Errorf("unable to create Drive service: %v", err)
+	}
+
+	return &Client{service: srv}, nil
+}
+
+// NewClientWithOAuth creates a new Drive client using OAuth credentials
+func NewClientWithOAuth(ctx context.Context, credentialsPath string) (*Client, error) {
 	b, err := os.ReadFile(credentialsPath)
 	if err != nil {
 		return nil, fmt.Errorf("unable to read credentials file: %v", err)
@@ -52,7 +80,7 @@ func NewClient(ctx context.Context, credentialsPath string) (*Client, error) {
 		return nil, fmt.Errorf("unable to parse credentials: %v", err)
 	}
 
-	client, err := getClient(config)
+	client, err := getOAuthClient(config)
 	if err != nil {
 		return nil, err
 	}
@@ -65,11 +93,13 @@ func NewClient(ctx context.Context, credentialsPath string) (*Client, error) {
 	return &Client{service: srv}, nil
 }
 
-// getClient retrieves a token, saves it, and returns the generated client
-func getClient(config *oauth2.Config) (*http.Client, error) {
+// getOAuthClient retrieves a token, saves it, and returns the generated client
+func getOAuthClient(config *oauth2.Config) (*http.Client, error) {
 	tokFile := "token.json"
 	tok, err := tokenFromFile(tokFile)
 	if err != nil {
+		// Set redirect to localhost for automatic capture
+		config.RedirectURL = "http://localhost:8085"
 		tok, err = getTokenFromWeb(config)
 		if err != nil {
 			return nil, err
@@ -79,19 +109,59 @@ func getClient(config *oauth2.Config) (*http.Client, error) {
 	return config.Client(context.Background(), tok), nil
 }
 
-// getTokenFromWeb requests a token from the web, then returns the token
+// getTokenFromWeb starts a local server to capture the OAuth callback
 func getTokenFromWeb(config *oauth2.Config) (*oauth2.Token, error) {
 	authURL := config.AuthCodeURL("state-token", oauth2.AccessTypeOffline)
-	fmt.Printf("Go to the following link in your browser:\n%v\n\nEnter authorization code: ", authURL)
 
+	// Channel to receive the auth code
+	codeChan := make(chan string)
+	errChan := make(chan error)
+
+	// Create a new ServeMux to avoid conflicts with default mux
+	mux := http.NewServeMux()
+	server := &http.Server{Addr: ":8085", Handler: mux}
+
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		code := r.URL.Query().Get("code")
+		if code == "" {
+			errChan <- fmt.Errorf("no code in callback")
+			fmt.Fprintf(w, "Error: No authorization code received. Please try again.")
+			return
+		}
+		fmt.Fprintf(w, "<html><body><h1>Authorization successful!</h1><p>You can close this window and return to the terminal.</p></body></html>")
+		codeChan <- code
+	})
+
+	go func() {
+		if err := server.ListenAndServe(); err != http.ErrServerClosed {
+			select {
+			case errChan <- err:
+			default:
+			}
+		}
+	}()
+
+	fmt.Printf("\n=== Google Drive Authorization ===\n")
+	fmt.Printf("Open this link in your browser:\n\n")
+	fmt.Printf("  %v\n\n", authURL)
+	fmt.Printf("Waiting for authorization...\n")
+
+	// Wait for the code
 	var authCode string
-	if _, err := fmt.Scan(&authCode); err != nil {
-		return nil, fmt.Errorf("unable to read authorization code: %v", err)
+	select {
+	case authCode = <-codeChan:
+		// Got the code
+	case err := <-errChan:
+		server.Close()
+		return nil, err
 	}
+
+	// Shutdown the server
+	server.Close()
 
 	tok, err := config.Exchange(context.TODO(), authCode)
 	if err != nil {
-		return nil, fmt.Errorf("unable to retrieve token from web: %v", err)
+		return nil, fmt.Errorf("unable to exchange token: %v", err)
 	}
 	return tok, nil
 }
@@ -131,16 +201,30 @@ func ExtractFolderID(url string) (string, error) {
 	return matches[1], nil
 }
 
-// ListFiles lists all files in a folder
+// ListFiles lists all files in a folder (non-recursive, for backward compatibility)
 func (c *Client) ListFiles(ctx context.Context, folderID string) ([]DriveFile, error) {
+	return c.listFilesWithPath(ctx, folderID, "", 0, 10)
+}
+
+// ListFilesRecursive lists all files in a folder and its subfolders up to maxDepth
+func (c *Client) ListFilesRecursive(ctx context.Context, folderID string, maxDepth int) ([]DriveFile, error) {
+	return c.listFilesWithPath(ctx, folderID, "", 0, maxDepth)
+}
+
+// listFilesWithPath is the internal recursive implementation
+func (c *Client) listFilesWithPath(ctx context.Context, folderID, currentPath string, currentDepth, maxDepth int) ([]DriveFile, error) {
 	var files []DriveFile
+	var subfolders []struct {
+		id   string
+		name string
+	}
 	pageToken := ""
 
 	for {
 		query := fmt.Sprintf("'%s' in parents and trashed = false", folderID)
 		call := c.service.Files.List().
 			Q(query).
-			Fields("nextPageToken, files(id, name, size)").
+			Fields("nextPageToken, files(id, name, size, mimeType, createdTime, modifiedTime)").
 			PageSize(1000)
 
 		if pageToken != "" {
@@ -153,12 +237,41 @@ func (c *Client) ListFiles(ctx context.Context, folderID string) ([]DriveFile, e
 		}
 
 		for _, f := range result.Files {
-			files = append(files, DriveFile{
+			// Check if it's a folder
+			if f.MimeType == "application/vnd.google-apps.folder" {
+				// Store folder for recursive processing
+				if currentDepth < maxDepth {
+					subfolders = append(subfolders, struct {
+						id   string
+						name string
+					}{id: f.Id, name: f.Name})
+				}
+				// Don't add folders to the file list
+				continue
+			}
+
+			file := DriveFile{
 				ID:       f.Id,
 				Name:     f.Name,
+				Path:     currentPath,
 				Size:     f.Size,
 				FolderID: folderID,
-			})
+				MimeType: f.MimeType,
+			}
+
+			// Parse timestamps
+			if f.CreatedTime != "" {
+				if t, err := time.Parse(time.RFC3339, f.CreatedTime); err == nil {
+					file.CreatedTime = t
+				}
+			}
+			if f.ModifiedTime != "" {
+				if t, err := time.Parse(time.RFC3339, f.ModifiedTime); err == nil {
+					file.ModifiedTime = t
+				}
+			}
+
+			files = append(files, file)
 		}
 
 		pageToken = result.NextPageToken
@@ -167,11 +280,31 @@ func (c *Client) ListFiles(ctx context.Context, folderID string) ([]DriveFile, e
 		}
 	}
 
+	// Recursively process subfolders
+	for _, subfolder := range subfolders {
+		subPath := subfolder.name
+		if currentPath != "" {
+			subPath = currentPath + "/" + subfolder.name
+		}
+
+		subFiles, err := c.listFilesWithPath(ctx, subfolder.id, subPath, currentDepth+1, maxDepth)
+		if err != nil {
+			// Log error but continue with other folders
+			continue
+		}
+		files = append(files, subFiles...)
+	}
+
 	return files, nil
 }
 
-// ListFilesFromFolders lists files from multiple folder URLs
+// ListFilesFromFolders lists files from multiple folder URLs (recursively)
 func (c *Client) ListFilesFromFolders(ctx context.Context, folderURLs []string) ([]DriveFile, error) {
+	return c.ListFilesFromFoldersWithDepth(ctx, folderURLs, 10)
+}
+
+// ListFilesFromFoldersWithDepth lists files from multiple folder URLs with specified max depth
+func (c *Client) ListFilesFromFoldersWithDepth(ctx context.Context, folderURLs []string, maxDepth int) ([]DriveFile, error) {
 	var allFiles []DriveFile
 	var mu sync.Mutex
 	var wg sync.WaitGroup
@@ -193,7 +326,7 @@ func (c *Client) ListFilesFromFolders(ctx context.Context, folderURLs []string) 
 				return
 			}
 
-			files, err := c.ListFiles(ctx, folderID)
+			files, err := c.ListFilesRecursive(ctx, folderID, maxDepth)
 			if err != nil {
 				errChan <- fmt.Errorf("folder %s: %v", folderID, err)
 				return
@@ -241,29 +374,64 @@ func FilterFiles(files []DriveFile, searchTerms []string) []DriveFile {
 
 // DownloadFile downloads a file to the specified directory
 func (c *Client) DownloadFile(ctx context.Context, file DriveFile, destDir string, progressChan chan<- DownloadProgress) error {
+	// Build the full destination path including subfolder structure
+	fullDestDir := destDir
+	if file.Path != "" {
+		fullDestDir = fmt.Sprintf("%s/%s", destDir, file.Path)
+	}
+
+	destPath := fmt.Sprintf("%s/%s", fullDestDir, file.Name)
+
+	// Check if file already exists with same size
+	if info, err := os.Stat(destPath); err == nil {
+		if info.Size() == file.Size {
+			// File exists and has same size, skip download
+			if progressChan != nil {
+				progressChan <- DownloadProgress{
+					FileID:      file.ID,
+					FileName:    file.DisplayName(),
+					BytesLoaded: file.Size,
+					TotalBytes:  file.Size,
+					Done:        true,
+					Skipped:     true,
+				}
+			}
+			return nil
+		}
+	}
+
 	resp, err := c.service.Files.Get(file.ID).Context(ctx).Download()
 	if err != nil {
 		return fmt.Errorf("unable to download file: %v", err)
 	}
 	defer resp.Body.Close()
 
-	destPath := fmt.Sprintf("%s/%s", destDir, file.Name)
+	// Create subdirectories if they don't exist
+	if file.Path != "" {
+		if err := os.MkdirAll(fullDestDir, 0755); err != nil {
+			return fmt.Errorf("unable to create directory %s: %v", fullDestDir, err)
+		}
+	}
+
 	out, err := os.Create(destPath)
 	if err != nil {
 		return fmt.Errorf("unable to create file: %v", err)
 	}
 	defer out.Close()
 
-	// Create a progress reader
-	pr := &progressReader{
-		reader:       resp.Body,
-		fileID:       file.ID,
-		fileName:     file.Name,
-		totalBytes:   file.Size,
-		progressChan: progressChan,
+	// Create a progress reader if channel provided
+	var reader io.Reader = resp.Body
+	if progressChan != nil {
+		reader = &progressReader{
+			reader:       resp.Body,
+			fileID:       file.ID,
+			fileName:     file.DisplayName(),
+			totalBytes:   file.Size,
+			progressChan: progressChan,
+		}
 	}
 
-	_, err = io.Copy(out, pr)
+	_, err = io.Copy(out, reader)
 	if err != nil {
 		return fmt.Errorf("unable to save file: %v", err)
 	}
@@ -272,7 +440,7 @@ func (c *Client) DownloadFile(ctx context.Context, file DriveFile, destDir strin
 	if progressChan != nil {
 		progressChan <- DownloadProgress{
 			FileID:      file.ID,
-			FileName:    file.Name,
+			FileName:    file.DisplayName(),
 			BytesLoaded: file.Size,
 			TotalBytes:  file.Size,
 			Done:        true,

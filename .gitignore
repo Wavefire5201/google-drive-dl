@@ -1,8 +1,10 @@
 # Binary
 gdrive-dl
 
-# Google Drive credentials/tokens
+# Environment and secrets
+.env
 token.json
+credentials.json
 
 # IDE
 .idea/

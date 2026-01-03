@@ -1,6 +1,5 @@
 # Binary
-gdrive-dl
-img-util
+google-drive-dl
 
 # Environment and secrets
 .env

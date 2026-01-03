@@ -1,4 +1,4 @@
-# img-util
+# google-drive-dl
 
 TUI application for downloading files from Google Drive folders.
 
@@ -21,26 +21,26 @@ go build
 
 ```bash
 # With API key
-./img-util -api-key YOUR_API_KEY
+./google-drive-dl -api-key YOUR_API_KEY
 
 # With OAuth
-./img-util -credentials path/to/credentials.json
+./google-drive-dl -credentials path/to/credentials.json
 
 # Auto-download with search terms
-./img-util -api-key KEY -links links.txt -search "term1,term2" -dest ./output
+./google-drive-dl -api-key KEY -links links.txt -search "term1,term2" -dest ./output
 ```
 
 ## Keybindings
 
-| Key | Action |
-|-----|--------|
-| j/k | Navigate up/down |
-| gg/G | Jump to top/bottom |
-| Space | Toggle selection |
-| a | Select all |
-| / | Search |
-| u | Toggle dedupe mode |
-| i | File info |
-| r | Refresh (clear cache) |
-| Enter | Confirm/Download |
-| q | Quit |
+| Key   | Action                |
+| ----- | --------------------- |
+| j/k   | Navigate up/down      |
+| gg/G  | Jump to top/bottom    |
+| Space | Toggle selection      |
+| a     | Select all            |
+| /     | Search                |
+| u     | Toggle dedupe mode    |
+| i     | File info             |
+| r     | Refresh (clear cache) |
+| Enter | Confirm/Download      |
+| q     | Quit                  |

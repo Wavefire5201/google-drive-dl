@@ -69,7 +69,7 @@ func NewManager() (*Manager, error) {
 func getCacheDir() (string, error) {
 	// Try XDG_CACHE_HOME first
 	if cacheHome := os.Getenv("XDG_CACHE_HOME"); cacheHome != "" {
-		return filepath.Join(cacheHome, "img-util"), nil
+		return filepath.Join(cacheHome, "google-drive-dl"), nil
 	}
 
 	// Fall back to ~/.cache
@@ -78,7 +78,7 @@ func getCacheDir() (string, error) {
 		return "", err
 	}
 
-	return filepath.Join(homeDir, ".cache", "img-util"), nil
+	return filepath.Join(homeDir, ".cache", "google-drive-dl"), nil
 }
 
 // load reads the cache from disk
@@ -94,7 +94,7 @@ func (m *Manager) load() error {
 // save writes the cache to disk
 func (m *Manager) save() error {
 	// Ensure cache directory exists
-	if err := os.MkdirAll(m.cacheDir, 0755); err != nil {
+	if err := os.MkdirAll(m.cacheDir, 0o755); err != nil {
 		return err
 	}
 
@@ -103,7 +103,7 @@ func (m *Manager) save() error {
 		return err
 	}
 
-	return os.WriteFile(m.cacheFile, data, 0644)
+	return os.WriteFile(m.cacheFile, data, 0o644)
 }
 
 // GetFolder returns cached data for a folder, or nil if not cached

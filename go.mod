@@ -1,4 +1,4 @@
-module img-util
+module google-drive-dl
 
 go 1.25.5
 

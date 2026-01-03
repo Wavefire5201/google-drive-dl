@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"os"
 
-	"img-util/drive"
-	"img-util/tui"
+	"google-drive-dl/drive"
+	"google-drive-dl/tui"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/joho/godotenv"
@@ -80,7 +80,7 @@ func main() {
 	}
 
 	// Create output directory if it doesn't exist
-	if err := os.MkdirAll(*destDir, 0755); err != nil {
+	if err := os.MkdirAll(*destDir, 0o755); err != nil {
 		fmt.Printf("Error creating output directory: %v\n", err)
 		os.Exit(1)
 	}

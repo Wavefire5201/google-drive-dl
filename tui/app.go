@@ -9,8 +9,8 @@ import (
 	"sync"
 	"time"
 
-	"img-util/cache"
-	"img-util/drive"
+	"google-drive-dl/cache"
+	"google-drive-dl/drive"
 
 	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/textinput"
@@ -112,16 +112,18 @@ type Model struct {
 }
 
 // Messages
-type errMsg struct{ err error }
-type filesLoadedMsg struct{ files []drive.DriveFile }
-type downloadProgressMsg drive.DownloadProgress
-type downloadCompleteMsg struct{ errors []string }
-type clientReadyMsg struct{ client *drive.Client }
-type tickMsg struct{}
-type filesFromCacheMsg struct {
-	files    []drive.DriveFile
-	cachedAt map[string]time.Time
-}
+type (
+	errMsg              struct{ err error }
+	filesLoadedMsg      struct{ files []drive.DriveFile }
+	downloadProgressMsg drive.DownloadProgress
+	downloadCompleteMsg struct{ errors []string }
+	clientReadyMsg      struct{ client *drive.Client }
+	tickMsg             struct{}
+	filesFromCacheMsg   struct {
+		files    []drive.DriveFile
+		cachedAt map[string]time.Time
+	}
+)
 type refreshCompleteMsg struct {
 	files []drive.DriveFile
 }

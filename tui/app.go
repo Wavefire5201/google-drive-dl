@@ -18,43 +18,44 @@ import (
 	"github.com/mattn/go-runewidth"
 )
 
-// AuthMethod represents the authentication method
-type AuthMethod int
-
-const (
-	AuthOAuth AuthMethod = iota
-	AuthAPIKey
-)
-
-// View represents the current screen
+// View represents the current screen state in the TUI.
+// The application progresses through views as the user interacts with it.
 type View int
 
 const (
-	ViewLinks    View = iota
-	ViewFileList      // New view to show all files with metadata
+	// ViewLinks is the initial view where users paste Google Drive folder links.
+	ViewLinks View = iota
+	// ViewFileList shows all files from the linked folders with metadata.
+	ViewFileList
+	// ViewSearch allows users to filter files by search terms.
 	ViewSearch
+	// ViewFiles shows filtered files matching the search criteria.
 	ViewFiles
+	// ViewDownloading shows download progress for selected files.
 	ViewDownloading
+	// ViewDone shows the final download summary.
 	ViewDone
 )
 
-// SortField represents which field to sort by
+// SortField represents which field to sort the file list by.
 type SortField int
 
 const (
+	// SortByName sorts files alphabetically by name.
 	SortByName SortField = iota
+	// SortBySize sorts files by their size in bytes.
 	SortBySize
+	// SortByDate sorts files by their modification date.
 	SortByDate
 )
 
-// Model is the main application model
+// Model is the main TUI application state. It implements the Bubble Tea Model
+// interface and manages all UI state, file data, and download progress.
 type Model struct {
 	view          View
 	width         int
 	height        int
 	err           error
-	authMethod    AuthMethod
-	authValue     string // API key or credentials path
 	linksFile     string
 	destDir       string
 	maxConcurrent int
@@ -88,6 +89,9 @@ type Model struct {
 	// Info popup
 	showInfoPopup bool
 
+	// File existence cache - maps file ID to whether it exists locally
+	fileExistsCache map[string]bool
+
 	// Dedupe mode - show only smallest version of duplicate files
 	showDeduped          bool
 	dedupedFiles         []drive.DriveFile
@@ -117,7 +121,6 @@ type (
 	filesLoadedMsg      struct{ files []drive.DriveFile }
 	downloadProgressMsg drive.DownloadProgress
 	downloadCompleteMsg struct{ errors []string }
-	clientReadyMsg      struct{ client *drive.Client }
 	tickMsg             struct{}
 	filesFromCacheMsg   struct {
 		files    []drive.DriveFile
@@ -129,44 +132,6 @@ type refreshCompleteMsg struct {
 }
 
 func (e errMsg) Error() string { return e.err.Error() }
-
-// NewModel creates a new TUI model (deprecated, use NewModelWithClient)
-func NewModel(authMethod AuthMethod, authValue, linksFile, destDir string, maxConcurrent int) Model {
-	ti := textarea.New()
-	ti.Placeholder = "Paste Google Drive folder links (one per line)..."
-	ti.Focus()
-	ti.SetWidth(80)
-	ti.SetHeight(10)
-
-	si := textinput.New()
-	si.Placeholder = "Search terms (comma-separated, e.g., 'abc, ddd') - leave empty to see all"
-	si.Width = 70
-
-	ctx, cancel := context.WithCancel(context.Background())
-
-	// Initialize cache manager (ignore errors, cache is optional)
-	cacheMgr, _ := cache.NewManager()
-
-	return Model{
-		view:          ViewLinks,
-		linksInput:    ti,
-		searchInput:   si,
-		selectedFiles: make(map[string]bool),
-		fileProgress:  make(map[string]drive.DownloadProgress),
-		progressMu:    &sync.Mutex{},
-		authMethod:    authMethod,
-		authValue:     authValue,
-		linksFile:     linksFile,
-		destDir:       destDir,
-		maxConcurrent: maxConcurrent,
-		ctx:           ctx,
-		cancel:        cancel,
-		sortField:     SortByName,
-		sortAsc:       true,
-		cacheManager:  cacheMgr,
-		cachedAt:      make(map[string]time.Time),
-	}
-}
 
 // NewModelWithClient creates a new TUI model with a pre-authenticated client
 func NewModelWithClient(client *drive.Client, linksFile, destDir string, maxConcurrent int, autoDownload bool, searchTerms string) Model {
@@ -191,6 +156,7 @@ func NewModelWithClient(client *drive.Client, linksFile, destDir string, maxConc
 		searchInput:     si,
 		selectedFiles:   make(map[string]bool),
 		fileProgress:    make(map[string]drive.DownloadProgress),
+		fileExistsCache: make(map[string]bool),
 		progressMu:      &sync.Mutex{},
 		driveClient:     client,
 		linksFile:       linksFile,
@@ -207,15 +173,11 @@ func NewModelWithClient(client *drive.Client, linksFile, destDir string, maxConc
 	}
 }
 
-// Init initializes the model
+// Init implements the Bubble Tea Model interface. It sets up the initial
+// state and starts any necessary commands like loading links from a file.
 func (m Model) Init() tea.Cmd {
 	cmds := []tea.Cmd{
 		textarea.Blink,
-	}
-
-	// Only init client if not already provided
-	if m.driveClient == nil {
-		cmds = append(cmds, m.initClient())
 	}
 
 	// Load links from file if provided
@@ -224,24 +186,6 @@ func (m Model) Init() tea.Cmd {
 	}
 
 	return tea.Batch(cmds...)
-}
-
-func (m Model) initClient() tea.Cmd {
-	return func() tea.Msg {
-		var client *drive.Client
-		var err error
-
-		if m.authMethod == AuthAPIKey {
-			client, err = drive.NewClientWithAPIKey(m.ctx, m.authValue)
-		} else {
-			client, err = drive.NewClientWithOAuth(m.ctx, m.authValue)
-		}
-
-		if err != nil {
-			return errMsg{err}
-		}
-		return clientReadyMsg{client}
-	}
 }
 
 func (m Model) loadLinksFromFile() tea.Cmd {
@@ -256,7 +200,8 @@ func (m Model) loadLinksFromFile() tea.Cmd {
 
 type linksFileLoadedMsg struct{ content string }
 
-// Update handles messages
+// Update implements the Bubble Tea Model interface. It handles all incoming
+// messages including keyboard events, window resizes, and async operation results.
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
@@ -302,10 +247,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 
-	case clientReadyMsg:
-		m.driveClient = msg.client
-		return m, nil
-
 	case linksFileLoadedMsg:
 		m.linksInput.SetValue(msg.content)
 		return m, nil
@@ -319,6 +260,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.cachedAt = msg.cachedAt
 		m.fromCache = true
 		m.sortFiles()
+		m.updateFileExistsCache()
 
 		// If auto-download mode is enabled, filter and download immediately
 		if m.autoDownload {
@@ -359,6 +301,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.allFiles = msg.files
 		m.fromCache = false
 		m.sortFiles()
+		m.updateFileExistsCache()
 
 		// Cache is already saved in loadFilesWithCache
 
@@ -413,6 +356,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case downloadCompleteMsg:
 		m.downloadDone = true
 		m.view = ViewDone
+		m.updateFileExistsCache() // Refresh cache after downloads
 		if len(msg.errors) > 0 {
 			m.err = fmt.Errorf("%d downloads failed", len(msg.errors))
 		}
@@ -467,11 +411,24 @@ func (m Model) submitLinks() (tea.Model, tea.Cmd) {
 	content := m.linksInput.Value()
 	lines := strings.Split(content, "\n")
 	var links []string
+	var invalidLinks []string
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
-		if line != "" && strings.Contains(line, "drive.google.com") {
-			links = append(links, line)
+		if line == "" {
+			continue
 		}
+		// Validate URL by attempting to extract folder ID
+		_, err := drive.ExtractFolderID(line)
+		if err != nil {
+			invalidLinks = append(invalidLinks, line)
+			continue
+		}
+		links = append(links, line)
+	}
+
+	if len(invalidLinks) > 0 && len(links) == 0 {
+		m.err = fmt.Errorf("no valid Google Drive folder links found. Invalid: %d", len(invalidLinks))
+		return m, nil
 	}
 
 	if len(links) == 0 {
@@ -908,7 +865,7 @@ func (m *Model) downloadFiles(files []drive.DriveFile) tea.Cmd {
 				m.progressMu.Unlock()
 
 				// Create a progress channel for this file
-				progressChan := make(chan drive.DownloadProgress, 10)
+				progressChan := make(chan drive.DownloadProgress, 100)
 
 				// Goroutine to update progress
 				done := make(chan struct{})
@@ -950,7 +907,8 @@ func (m *Model) downloadFiles(files []drive.DriveFile) tea.Cmd {
 	}
 }
 
-// View renders the UI
+// View implements the Bubble Tea Model interface. It renders the current
+// view state to a string for display in the terminal.
 func (m Model) View() string {
 	var s strings.Builder
 
@@ -994,11 +952,7 @@ func (m Model) viewLinks() string {
 		s.WriteString(WarningStyle.Render("Connecting to Google Drive..."))
 	} else {
 		s.WriteString("\n")
-		if m.authMethod == AuthAPIKey {
-			s.WriteString(DimStyle.Render("Auth: API Key"))
-		} else {
-			s.WriteString(DimStyle.Render("Auth: OAuth"))
-		}
+		s.WriteString(DimStyle.Render("Connected to Google Drive"))
 	}
 
 	return s.String()
@@ -1052,6 +1006,36 @@ func (m Model) viewFileList() string {
 	}
 	s.WriteString("\n")
 
+	// Render the file list using the shared helper
+	m.renderFileList(&s, displayFiles, fileListConfig{
+		showSortIndicators: true,
+		helpText:           "j/k:move | gg/G:top/bottom | Space:toggle | a:all | i:info | u:dedupe | r:refresh | Enter:download | /:search | n/s/d:sort | q:quit",
+	})
+
+	return s.String()
+}
+
+func (m Model) viewSearch() string {
+	var s strings.Builder
+
+	s.WriteString(SubtitleStyle.Render(fmt.Sprintf("Search in %d files:", len(m.allFiles))))
+	s.WriteString("\n")
+	s.WriteString(m.searchInput.View())
+	s.WriteString("\n")
+	s.WriteString(HelpStyle.Render("Enter to search (empty = all files) | Esc to go back"))
+
+	return s.String()
+}
+
+// fileListConfig holds configuration for rendering a file list view.
+type fileListConfig struct {
+	showSortIndicators bool   // whether to show sort direction indicators in the header
+	helpText           string // help text to display at the bottom
+}
+
+// renderFileList renders a paginated file list with cursor, checkboxes, and metadata.
+// It handles the common rendering logic shared between viewFileList and viewFiles.
+func (m Model) renderFileList(s *strings.Builder, files []drive.DriveFile, config fileListConfig) {
 	// Calculate dynamic widths based on terminal width
 	width := m.width
 	if width < 80 {
@@ -1065,20 +1049,24 @@ func (m Model) viewFileList() string {
 	}
 
 	// Header
-	sortIndicator := func(field SortField) string {
-		if m.sortField == field {
-			if m.sortAsc {
-				return " ^"
+	var header string
+	if config.showSortIndicators {
+		sortIndicator := func(field SortField) string {
+			if m.sortField == field {
+				if m.sortAsc {
+					return " ^"
+				}
+				return " v"
 			}
-			return " v"
+			return ""
 		}
-		return ""
+		header = fmt.Sprintf("       %s %10s %12s",
+			padRight("Name"+sortIndicator(SortByName), nameWidth),
+			"Size"+sortIndicator(SortBySize),
+			"Modified"+sortIndicator(SortByDate))
+	} else {
+		header = fmt.Sprintf("       %s %10s %12s", padRight("Name", nameWidth), "Size", "Modified")
 	}
-
-	header := fmt.Sprintf("       %s %10s %12s",
-		padRight("Name"+sortIndicator(SortByName), nameWidth),
-		"Size"+sortIndicator(SortBySize),
-		"Modified"+sortIndicator(SortByDate))
 	s.WriteString(DimStyle.Render(header))
 	s.WriteString("\n")
 	s.WriteString(DimStyle.Render(strings.Repeat("-", width-2)))
@@ -1086,20 +1074,20 @@ func (m Model) viewFileList() string {
 
 	// Pagination
 	visibleStart := 0
-	visibleEnd := len(displayFiles)
+	visibleEnd := len(files)
 	maxVisible := m.height - 12
 	if maxVisible < 5 {
 		maxVisible = 10
 	}
 
-	if len(displayFiles) > maxVisible {
+	if len(files) > maxVisible {
 		visibleStart = m.fileCursor - maxVisible/2
 		if visibleStart < 0 {
 			visibleStart = 0
 		}
 		visibleEnd = visibleStart + maxVisible
-		if visibleEnd > len(displayFiles) {
-			visibleEnd = len(displayFiles)
+		if visibleEnd > len(files) {
+			visibleEnd = len(files)
 			visibleStart = visibleEnd - maxVisible
 			if visibleStart < 0 {
 				visibleStart = 0
@@ -1107,8 +1095,9 @@ func (m Model) viewFileList() string {
 		}
 	}
 
+	// File rows
 	for i := visibleStart; i < visibleEnd; i++ {
-		f := displayFiles[i]
+		f := files[i]
 		cursor := "  "
 		if i == m.fileCursor {
 			cursor = "> "
@@ -1147,27 +1136,13 @@ func (m Model) viewFileList() string {
 	}
 
 	s.WriteString("\n")
-	s.WriteString(HelpStyle.Render("j/k:move | gg/G:top/bottom | Space:toggle | a:all | i:info | u:dedupe | r:refresh | Enter:download | /:search | n/s/d:sort | q:quit"))
+	s.WriteString(HelpStyle.Render(config.helpText))
 
 	// Show info popup if active
-	if m.showInfoPopup && m.fileCursor < len(displayFiles) {
+	if m.showInfoPopup && m.fileCursor < len(files) {
 		s.WriteString("\n\n")
-		s.WriteString(m.renderInfoPopup(displayFiles[m.fileCursor]))
+		s.WriteString(m.renderInfoPopup(files[m.fileCursor]))
 	}
-
-	return s.String()
-}
-
-func (m Model) viewSearch() string {
-	var s strings.Builder
-
-	s.WriteString(SubtitleStyle.Render(fmt.Sprintf("Search in %d files:", len(m.allFiles))))
-	s.WriteString("\n")
-	s.WriteString(m.searchInput.View())
-	s.WriteString("\n")
-	s.WriteString(HelpStyle.Render("Enter to search (empty = all files) | Esc to go back"))
-
-	return s.String()
 }
 
 func (m Model) viewFiles() string {
@@ -1198,95 +1173,11 @@ func (m Model) viewFiles() string {
 		selectedCount, len(displayFiles), formatSize(selectedSize), dedupeIndicator)))
 	s.WriteString("\n")
 
-	// Calculate dynamic widths based on terminal width
-	width := m.width
-	if width < 80 {
-		width = 80
-	}
-	// Reserve space for: cursor(2) + checkbox(3) + space(1) + icon(2) + size(10) + space(1) + date(12) + padding(4)
-	fixedWidth := 2 + 3 + 1 + 2 + 10 + 1 + 12 + 4
-	nameWidth := width - fixedWidth
-	if nameWidth < 20 {
-		nameWidth = 20
-	}
-
-	// Header
-	header := fmt.Sprintf("       %s %10s %12s", padRight("Name", nameWidth), "Size", "Modified")
-	s.WriteString(DimStyle.Render(header))
-	s.WriteString("\n")
-	s.WriteString(DimStyle.Render(strings.Repeat("-", width-2)))
-	s.WriteString("\n")
-
-	// Pagination
-	visibleStart := 0
-	visibleEnd := len(displayFiles)
-	maxVisible := m.height - 12
-	if maxVisible < 5 {
-		maxVisible = 10
-	}
-
-	if len(displayFiles) > maxVisible {
-		visibleStart = m.fileCursor - maxVisible/2
-		if visibleStart < 0 {
-			visibleStart = 0
-		}
-		visibleEnd = visibleStart + maxVisible
-		if visibleEnd > len(displayFiles) {
-			visibleEnd = len(displayFiles)
-			visibleStart = visibleEnd - maxVisible
-			if visibleStart < 0 {
-				visibleStart = 0
-			}
-		}
-	}
-
-	for i := visibleStart; i < visibleEnd; i++ {
-		f := displayFiles[i]
-		cursor := "  "
-		if i == m.fileCursor {
-			cursor = "> "
-		}
-
-		checkbox := "[ ]"
-		if m.selectedFiles[f.ID] {
-			checkbox = "[x]"
-		}
-
-		// Show green square if file exists locally
-		existsIcon := "  "
-		if m.fileExistsLocally(f) {
-			existsIcon = SuccessStyle.Render("■") + " "
-		}
-
-		dateStr := ""
-		if !f.ModifiedTime.IsZero() {
-			dateStr = f.ModifiedTime.Format("2006-01-02")
-		}
-
-		line := fmt.Sprintf("%s%s %s%s %10s %12s",
-			cursor,
-			checkbox,
-			existsIcon,
-			truncateAndPad(f.DisplayName(), nameWidth),
-			formatSize(f.Size),
-			dateStr)
-
-		if i == m.fileCursor {
-			s.WriteString(SelectedStyle.Render(line))
-		} else {
-			s.WriteString(NormalStyle.Render(line))
-		}
-		s.WriteString("\n")
-	}
-
-	s.WriteString("\n")
-	s.WriteString(HelpStyle.Render("j/k:move | gg/G:top/bottom | Space:toggle | a:all | i:info | u:dedupe | Enter:download | Esc:back | q:quit"))
-
-	// Show info popup if active
-	if m.showInfoPopup && m.fileCursor < len(displayFiles) {
-		s.WriteString("\n\n")
-		s.WriteString(m.renderInfoPopup(displayFiles[m.fileCursor]))
-	}
+	// Render the file list using the shared helper
+	m.renderFileList(&s, displayFiles, fileListConfig{
+		showSortIndicators: false,
+		helpText:           "j/k:move | gg/G:top/bottom | Space:toggle | a:all | i:info | u:dedupe | Enter:download | Esc:back | q:quit",
+	})
 
 	return s.String()
 }
@@ -1577,7 +1468,16 @@ func truncate(s string, max int) string {
 }
 
 // fileExistsLocally checks if a file already exists in the destination directory with the same size
+// Uses cached result if available
 func (m Model) fileExistsLocally(f drive.DriveFile) bool {
+	if exists, ok := m.fileExistsCache[f.ID]; ok {
+		return exists
+	}
+	return false
+}
+
+// checkFileExistsLocally performs the actual filesystem check
+func (m Model) checkFileExistsLocally(f drive.DriveFile) bool {
 	destDir := m.destDir
 	if destDir == "" {
 		destDir = "./output"
@@ -1594,6 +1494,13 @@ func (m Model) fileExistsLocally(f drive.DriveFile) bool {
 		return false
 	}
 	return info.Size() == f.Size
+}
+
+// updateFileExistsCache updates the file existence cache for all files
+func (m *Model) updateFileExistsCache() {
+	for _, f := range m.allFiles {
+		m.fileExistsCache[f.ID] = m.checkFileExistsLocally(f)
+	}
 }
 
 // dedupeFiles groups files by folder and common prefix, returning only the smallest version of each group
@@ -1743,24 +1650,4 @@ func isSuffixRemnant(s string) bool {
 		}
 	}
 	return false
-}
-
-// commonPrefix returns the common prefix of two strings
-func commonPrefix(a, b string) string {
-	runesA := []rune(a)
-	runesB := []rune(b)
-
-	minLen := len(runesA)
-	if len(runesB) < minLen {
-		minLen = len(runesB)
-	}
-
-	var i int
-	for i = 0; i < minLen; i++ {
-		if runesA[i] != runesB[i] {
-			break
-		}
-	}
-
-	return string(runesA[:i])
 }

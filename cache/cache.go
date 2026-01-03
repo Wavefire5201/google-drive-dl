@@ -4,10 +4,12 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 )
 
-// CachedFile represents a cached file entry
+// CachedFile represents a cached file entry with its metadata.
+// This mirrors the drive.DriveFile structure for serialization.
 type CachedFile struct {
 	ID           string    `json:"id"`
 	Name         string    `json:"name"`
@@ -19,21 +21,28 @@ type CachedFile struct {
 	ModifiedTime time.Time `json:"modified_time"`
 }
 
-// FolderCache represents cached data for a single folder
+// FolderCache represents cached data for a single Google Drive folder.
 type FolderCache struct {
-	FolderID   string       `json:"folder_id"`
-	FolderName string       `json:"folder_name"`
-	Files      []CachedFile `json:"files"`
-	FetchedAt  time.Time    `json:"fetched_at"`
+	// FolderID is the unique Google Drive folder identifier
+	FolderID string `json:"folder_id"`
+	// FolderName is the display name of the folder
+	FolderName string `json:"folder_name"`
+	// Files contains all cached files in this folder
+	Files []CachedFile `json:"files"`
+	// FetchedAt is when the folder contents were last fetched
+	FetchedAt time.Time `json:"fetched_at"`
 }
 
-// Cache represents the full cache structure
+// Cache represents the full cache structure stored on disk.
 type Cache struct {
+	// Folders maps folder IDs to their cached data
 	Folders map[string]*FolderCache `json:"folders"`
 }
 
-// Manager handles cache operations
+// Manager handles cache operations with thread-safe access.
+// It persists folder file listings to disk for faster subsequent access.
 type Manager struct {
+	mu        sync.RWMutex
 	cacheDir  string
 	cacheFile string
 	cache     *Cache
@@ -108,11 +117,15 @@ func (m *Manager) save() error {
 
 // GetFolder returns cached data for a folder, or nil if not cached
 func (m *Manager) GetFolder(folderID string) *FolderCache {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	return m.cache.Folders[folderID]
 }
 
 // SetFolder stores folder data in cache
 func (m *Manager) SetFolder(folderID string, folderName string, files []CachedFile) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.cache.Folders[folderID] = &FolderCache{
 		FolderID:   folderID,
 		FolderName: folderName,
@@ -125,12 +138,16 @@ func (m *Manager) SetFolder(folderID string, folderName string, files []CachedFi
 
 // InvalidateFolder removes a folder from cache
 func (m *Manager) InvalidateFolder(folderID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	delete(m.cache.Folders, folderID)
 	return m.save()
 }
 
 // GetAllCachedFolderIDs returns all cached folder IDs
 func (m *Manager) GetAllCachedFolderIDs() []string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	ids := make([]string, 0, len(m.cache.Folders))
 	for id := range m.cache.Folders {
 		ids = append(ids, id)
@@ -140,6 +157,8 @@ func (m *Manager) GetAllCachedFolderIDs() []string {
 
 // Clear removes all cached data
 func (m *Manager) Clear() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.cache = &Cache{
 		Folders: make(map[string]*FolderCache),
 	}
